@@ -1,0 +1,501 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloud Data Processing Pipeline
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  DataIngestTopic:
+    Type: String
+    MinLength: 1
+    Default: elgo/v1/kitchenappliance1/#
+    Description: MQTT Topic Name
+Resources:
+  IngestDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LoggingConfiguration:
+        DestinationBucketName:
+          Ref: LogsBucket
+        LogFilePrefix: iot-data-ingest/
+      LifecycleConfiguration:
+        Rules:
+        - Id: ExpirationRule
+          Status: Enabled
+          ExpirationInDays: '7'
+    Metadata:
+      SamResourceId: IngestDataBucket
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+    - S3NotificationLambdaFunction
+    - LogsBucket
+    Properties:
+      LoggingConfiguration:
+        DestinationBucketName:
+          Ref: LogsBucket
+        LogFilePrefix: processed-data/
+      LifecycleConfiguration:
+        Rules:
+        - Id: ExpirationRule
+          Status: Enabled
+          ExpirationInDays: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: s3:ObjectCreated:Put
+          Function:
+            Fn::GetAtt:
+            - S3NotificationLambdaFunction
+            - Arn
+          Filter:
+            S3Key:
+              Rules:
+              - Name: prefix
+                Value: processed-data/
+    Metadata:
+      SamResourceId: ProcessedDataBucket
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W35
+          reason: This is the logs bucket
+      SamResourceId: LogsBucket
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: LogsBucket
+    Properties:
+      Bucket:
+        Ref: LogsBucket
+      PolicyDocument:
+        Statement:
+        - Sid: AllowLogDeliveryFromIngestAndProcessedBuckets
+          Effect: Allow
+          Principal: '*'
+          Action:
+          - s3:PutObject
+          Resource:
+          - Fn::Sub: ${LogsBucket.Arn}/iot-data-ingest/*
+          - Fn::Sub: ${LogsBucket.Arn}/processed-data/*
+          Condition:
+            StringEquals:
+              s3:x-amz-acl: bucket-owner-full-control
+    Metadata:
+      SamResourceId: LogsBucketPolicy
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        Description: Send IoT Device data in raw format to Kinesis Analytics
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: 'false'
+        Sql:
+          Fn::Sub: SELECT * FROM "${DataIngestTopic}"
+        Actions:
+        - Firehose:
+            DeliveryStreamName:
+              Ref: IngestDataDeliveryStream
+            RoleArn:
+              Fn::Sub: ${IoTTopicRuleRole.Arn}
+            Separator: '
+
+              '
+        - Kinesis:
+            StreamName:
+              Ref: RawDataIngestStream
+            RoleArn:
+              Fn::GetAtt:
+              - IoTTopicRuleRole
+              - Arn
+    Metadata:
+      SamResourceId: IoTTopicRule
+  IngestDataDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      S3DestinationConfiguration:
+        BucketARN:
+          Fn::GetAtt:
+          - IngestDataBucket
+          - Arn
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 100
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName:
+            Ref: IoTDataProcessingLogGroup
+          LogStreamName: IngestDataS3Delivery
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        Prefix: raw-data/
+        RoleARN:
+          Fn::GetAtt:
+          - IngestDataDeliveryStreamRole
+          - Arn
+    Metadata:
+      SamResourceId: IngestDataDeliveryStream
+  RawDataIngestStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+    Metadata:
+      SamResourceId: RawDataIngestStream
+  AnomalyDetectionApplication:
+    Type: AWS::KinesisAnalytics::Application
+    Properties:
+      ApplicationCode: "CREATE OR REPLACE STREAM \"POWER_ANOMALY_STREAM\" (\n  \"\
+        deviceLabel\" VARCHAR(512),\n  \"devicePower\" DOUBLE,\n  \"recordedTimestamp\"\
+        \ TIMESTAMP,\n  \"rcfAnomalyScore\" DOUBLE\n);\nCREATE OR REPLACE PUMP \"\
+        POWER_ANOMALY_PUMP\" AS\nINSERT INTO \"POWER_ANOMALY_STREAM\"\nSELECT STREAM\n\
+        \  \"deviceLabel\",\n  \"devicePower\",\n  \"recordedTimestamp\",\n  ANOMALY_SCORE\
+        \ as rcfAnomalyScore\nFROM TABLE(\n  RANDOM_CUT_FOREST(\n    CURSOR(SELECT\
+        \ STREAM \"deviceLabel\", \"devicePower\", \"recordedTimestamp\" FROM \"SOURCE_SQL_STREAM\"\
+        ),\n    100, 256, 100000, 10)\n);\n"
+      Inputs:
+      - NamePrefix: SOURCE_SQL_STREAM
+        InputSchema:
+          RecordColumns:
+          - Name: devicePower
+            SqlType: DOUBLE
+            Mapping: $.devicePower
+          - Name: recordedTimestamp
+            SqlType: TIMESTAMP
+            Mapping: $.recordedTimestamp
+          - Name: deviceLabel
+            SqlType: VARCHAR(512)
+            Mapping: $.deviceLabel
+          RecordFormat:
+            RecordFormatType: JSON
+            MappingParameters:
+              JSONMappingParameters:
+                RecordRowPath: $
+        KinesisStreamsInput:
+          ResourceARN:
+            Fn::GetAtt:
+            - RawDataIngestStream
+            - Arn
+          RoleARN:
+            Fn::GetAtt:
+            - KinesisAnalyticsRole
+            - Arn
+    Metadata:
+      SamResourceId: AnomalyDetectionApplication
+  AnomalyDetectionApplicationOutput:
+    Type: AWS::KinesisAnalytics::ApplicationOutput
+    Properties:
+      ApplicationName:
+        Ref: AnomalyDetectionApplication
+      Output:
+        DestinationSchema:
+          RecordFormatType: CSV
+        KinesisFirehoseOutput:
+          ResourceARN:
+            Fn::GetAtt:
+            - processedDataDeliveryStream
+            - Arn
+          RoleARN:
+            Fn::GetAtt:
+            - KinesisAnalyticsRole
+            - Arn
+        Name: POWER_ANOMALY_STREAM
+    Metadata:
+      SamResourceId: AnomalyDetectionApplicationOutput
+  processedDataDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      S3DestinationConfiguration:
+        BucketARN:
+          Fn::GetAtt:
+          - ProcessedDataBucket
+          - Arn
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 100
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName:
+            Ref: IoTDataProcessingLogGroup
+          LogStreamName: processedDataS3Delivery
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        Prefix: processed-data/
+        RoleARN:
+          Fn::GetAtt:
+          - processedDataDeliveryStreamRole
+          - Arn
+    Metadata:
+      SamResourceId: processedDataDeliveryStream
+  S3NotificationLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://elgo-ka1-ad-v3-730335507769-us-east-1-dev/1afb3b3102f4f2ae9956d69ede200dc6
+      Handler: lambda.lambda_handler
+      Runtime: python3.12
+      Description: Invokes Sagemaker endpoint as new data arrives in S3.
+      MemorySize: 256
+      Role:
+        Fn::GetAtt:
+        - LambdaIAMRole
+        - Arn
+      Timeout: 300
+    Metadata:
+      SamResourceId: S3NotificationLambdaFunction
+  IoTDataProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+    Metadata:
+      SamResourceId: IoTDataProcessingLogGroup
+  IoTDataProcessingLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName:
+        Ref: IoTDataProcessingLogGroup
+    Metadata:
+      SamResourceId: IoTDataProcessingLogStream
+  IngestDataDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - firehose.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: IngestDataS3UploadPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:AbortMultipartUpload
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:PutObject
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            Resource:
+            - Fn::Sub: ${IngestDataBucket.Arn}
+            - Fn::Sub: ${IngestDataBucket.Arn}/
+            - Fn::Sub: ${IngestDataBucket.Arn}/*
+      - PolicyName: IngestDataDeliveryStreamLogging
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutDestination
+            - logs:PutLogEvents
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:logs:'
+                - Ref: AWS::Region
+                - ':'
+                - Ref: AWS::AccountId
+                - :log-group:*
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: The wildcard action in the logs policy is required
+      SamResourceId: IngestDataDeliveryStreamRole
+  processedDataDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - firehose.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: processedDataS3UploadPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:AbortMultipartUpload
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:PutObject
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            Resource:
+            - Fn::Sub: ${ProcessedDataBucket.Arn}
+            - Fn::Sub: ${ProcessedDataBucket.Arn}/
+            - Fn::Sub: ${ProcessedDataBucket.Arn}/*
+      - PolicyName: IngestDataDeliveryStreamLogging
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutDestination
+            - logs:PutLogEvents
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:logs:'
+                - Ref: AWS::Region
+                - ':'
+                - Ref: AWS::AccountId
+                - :log-group:*
+    Metadata:
+      SamResourceId: processedDataDeliveryStreamRole
+  IoTTopicRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - iot.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: IoTTopicRulePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            Effect: Allow
+            Action:
+            - firehose:DescribeDeliveryStream
+            - firehose:ListDeliveryStreams
+            - firehose:PutRecord
+            - firehose:PutRecordBatch
+            Resource:
+              Fn::Sub: ${IngestDataDeliveryStream.Arn}
+      - PolicyName: IoTTopicRuleKinesisPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - kinesis:PutRecord
+            - kinesis:PutRecords
+            Resource:
+            - Fn::GetAtt:
+              - RawDataIngestStream
+              - Arn
+    Metadata:
+      SamResourceId: IoTTopicRuleRole
+  KinesisAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: kinesisanalytics.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: Open
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: '*'
+    Metadata:
+      SamResourceId: KinesisAnalyticsRole
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+    - ProcessedDataBucket
+    - S3NotificationLambdaFunction
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+        - S3NotificationLambdaFunction
+        - Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${ProcessedDataBucket}
+    Metadata:
+      SamResourceId: LambdaInvokePermission
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            - sagemaker:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+    Metadata:
+      SamResourceId: LambdaIAMRole
+Outputs:
+  IngestDataDeliveryStreamArn:
+    Description: Arn of Ingest Data Delivery Stream
+    Value:
+      Fn::GetAtt:
+      - IngestDataDeliveryStream
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-IngestDataDeliveryStreamArn
+  ProcessedDataBucketArn:
+    Description: Arn of S3 bucket for processed data
+    Value:
+      Fn::GetAtt:
+      - ProcessedDataBucket
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ProcessedDataBucketArn
+  IoTDataProcessingLogGroup:
+    Description: Log Group Name for logging
+    Value:
+      Ref: IoTDataProcessingLogGroup
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-IoTDataProcessingLogGroup

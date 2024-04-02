@@ -1,17 +1,19 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Cloud Data Processing Pipeline for Refrigerator"
+Description: "Cloud Data Processing Pipeline"
 Transform: AWS::Serverless-2016-10-31
 Parameters:
   DataIngestTopic:
     Type: String
     MinLength: 1
-    Default: "elgo/refrigeraor/v1/power"
+    Default: "elgo/v1/refrigerator/#" #
     Description: "MQTT Topic Name"
 
 Resources:
   ########################################################################
   # S3
   ########################################################################
+  # S3 Buckets
+  # Bucket for input data
   IngestDataBucket:
     # DeletionPolicy: Retain
     Type: AWS::S3::Bucket
@@ -41,16 +43,15 @@ Resources:
           - Id: ExpirationRule
             Status: Enabled
             ExpirationInDays: 7
-      # DO this once stack is setup
-      NotificationConfiguration: #Update stack with NotificationConfiguration
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:Put
-            Function: !GetAtt S3NotificationLambdaFunction.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: processed-data/
+      # NotificationConfiguration: #Update stack with NotificationConfiguration
+      #   LambdaConfigurations:
+      #     - Event: s3:ObjectCreated:Put
+      #       Function: !GetAtt S3NotificationLambdaFunction.Arn
+      #       Filter:
+      #         S3Key:
+      #           Rules:
+      #             - Name: prefix
+      #               Value: processed-data/
   LogsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -84,7 +85,10 @@ Resources:
                 s3:x-amz-acl: "bucket-owner-full-control"
   ########################################################################
   # IoT Pipeline
-  ###############################qs#########################################
+  ########################################################################
+
+  # IoT
+  # [To change] Send to Kineis Firehose and to Kinesis Data Stream
   IoTTopicRule:
     Type: AWS::IoT::TopicRule
     Properties:
@@ -102,6 +106,7 @@ Resources:
           - Kinesis:
               StreamName: !Ref RawDataIngestStream
               RoleArn: !GetAtt IoTTopicRuleRole.Arn
+
   # Ingest Data Delivery Stream
   IngestDataDeliveryStream:
     Type: AWS::KinesisFirehose::DeliveryStream
@@ -127,59 +132,49 @@ Resources:
     Properties:
       ShardCount: 1 # Specify the appropriate number of shards for your use case
 
-AnomalyDetectionApplication:
-  Type: AWS::KinesisAnalytics::Application
-  Properties:
-    ApplicationCode: |
-      CREATE OR REPLACE STREAM "SQL_STREAM_POWER_CONSUMPTION" (
-        "DeviceID" INTEGER,
-        "power" DOUBLE,
-        "Timestamp" TIMESTAMP
-      );
-
-      CREATE OR REPLACE PUMP "STREAM_PUMP_POWER_CONSUMPTION" AS INSERT INTO "SQL_STREAM_POWER_CONSUMPTION"
-      SELECT STREAM
-        s."DeviceID" as DeviceID,
-        s."power" as power, -- Using direct value instead of AVG since data is not aggregated over sub-second intervals
-        STEP(s."Timestamp" BY INTERVAL '8' SECOND) AS "Timestamp"
-      FROM "SOURCE_SQL_STREAM_001" s
-      GROUP BY s."DeviceID", STEP(s."Timestamp" BY INTERVAL '8' SECOND);
-
-      CREATE OR REPLACE STREAM "POWER_ANOMALY_STREAM" (
-        "DeviceID" INTEGER,
-        "power" DOUBLE,
-        "Timestamp" TIMESTAMP,
-        "ANOMALY_SCORE" DOUBLE,
-        "ANOMALY_EXPLANATION" varchar(512)
-      );
-
-      CREATE OR REPLACE PUMP "POWER_ANOMALY_PUMP" AS
-      INSERT INTO "POWER_ANOMALY_STREAM"
-      SELECT STREAM "DeviceID", "power", "Timestamp", ANOMALY_SCORE, ANOMALY_EXPLANATION
-      FROM TABLE(RANDOM_CUT_FOREST_WITH_EXPLANATION(
-        CURSOR(SELECT STREAM * FROM "SQL_STREAM_POWER_CONSUMPTION"), 100, 100, 100000, 5, true));
-
-    Inputs:
-      - NamePrefix: "SOURCE_SQL_STREAM"
-        InputSchema:
-          RecordColumns:
-            - Name: "power"
-              SqlType: "DOUBLE"
-              Mapping: "$.power"
-            - Name: "Timestamp"
-              SqlType: "TIMESTAMP"
-              Mapping: "$.Timestamp"
-            - Name: "DeviceID"
-              SqlType: "INTEGER"
-              Mapping: "$.DeviceID"
-          RecordFormat:
-            RecordFormatType: "JSON"
-            MappingParameters:
-              JSONMappingParameters:
-                RecordRowPath: "$"
-        KinesisStreamsInput:
-          ResourceARN: !GetAtt RawDataIngestStream.Arn
-          RoleARN: !GetAtt KinesisAnalyticsRole.Arn
+  AnomalyDetectionApplication:
+    Type: AWS::KinesisAnalytics::Application
+    Properties:
+      ApplicationCode: |
+        CREATE OR REPLACE STREAM "POWER_ANOMALY_STREAM" (
+          "deviceLabel" VARCHAR(512),
+          "devicePower" DOUBLE,
+          "recordedTimestamp" TIMESTAMP,
+          "rcfAnomalyScore" DOUBLE
+        );
+        CREATE OR REPLACE PUMP "POWER_ANOMALY_PUMP" AS
+        INSERT INTO "POWER_ANOMALY_STREAM"
+        SELECT STREAM
+          "deviceLabel",
+          "devicePower",
+          "recordedTimestamp",
+          ANOMALY_SCORE as rcfAnomalyScore
+        FROM TABLE(
+          RANDOM_CUT_FOREST(
+            CURSOR(SELECT STREAM "deviceLabel", "devicePower", "recordedTimestamp" FROM "SOURCE_SQL_STREAM"),
+            100, 256, 100000, 5)
+        );
+      Inputs:
+        - NamePrefix: "SOURCE_SQL_STREAM"
+          InputSchema:
+            RecordColumns:
+              - Name: "devicePower"
+                SqlType: "DOUBLE"
+                Mapping: "$.devicePower"
+              - Name: "recordedTimestamp"
+                SqlType: "TIMESTAMP"
+                Mapping: "$.recordedTimestamp"
+              - Name: "deviceLabel"
+                SqlType: "VARCHAR(512)"
+                Mapping: "$.deviceLabel"
+            RecordFormat:
+              RecordFormatType: "JSON"
+              MappingParameters:
+                JSONMappingParameters:
+                  RecordRowPath: "$"
+          KinesisStreamsInput:
+            ResourceARN: !GetAtt RawDataIngestStream.Arn
+            RoleARN: !GetAtt KinesisAnalyticsRole.Arn
 
   AnomalyDetectionApplicationOutput:
     Type: AWS::KinesisAnalytics::ApplicationOutput
@@ -191,7 +186,7 @@ AnomalyDetectionApplication:
         KinesisFirehoseOutput:
           ResourceARN: !GetAtt processedDataDeliveryStream.Arn
           RoleARN: !GetAtt KinesisAnalyticsRole.Arn
-        Name: SQL_STREAM_TEMPERATURE
+        Name: POWER_ANOMALY_STREAM
 
   # Ingest Data Delivery Stream
   processedDataDeliveryStream:
@@ -215,7 +210,7 @@ AnomalyDetectionApplication:
   S3NotificationLambdaFunction:
     Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
     Properties:
-      CodeUri: lambda_functions/s3_notification_receiver
+      CodeUri: lambda_functions/s3_notification_receiver/refrigerator
       Handler: lambda.lambda_handler
       Runtime: python3.12
       Description: Invokes Sagemaker endpoint as new data arrives in S3.
@@ -226,6 +221,7 @@ AnomalyDetectionApplication:
   ########################################################################
   # IAM Roles & Logs
   ########################################################################
+  # Logs
   IoTDataProcessingLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -343,7 +339,7 @@ AnomalyDetectionApplication:
                     - !Ref AWS::AccountId
                     - ":log-group:*"
 
-  IoTTopicRuleRole: # Need to change and update for Kinesis DataStreamd
+  IoTTopicRuleRole: # Need to change and update for Kinesis DataStream
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -403,6 +399,7 @@ AnomalyDetectionApplication:
   LambdaInvokePermission:
     Type: "AWS::Lambda::Permission"
     DependsOn:
+      - ProcessedDataBucket
       - S3NotificationLambdaFunction
     Properties:
       FunctionName: !GetAtt S3NotificationLambdaFunction.Arn
@@ -442,7 +439,7 @@ AnomalyDetectionApplication:
                 Resource: "arn:aws:logs:*:*:*"
 
 Outputs:
-  IngestDataDeliveryStreamArn: # migh also need arn of kinesis data stream over here.
+  IngestDataDeliveryStreamArn:
     Description: Arn of Ingest Data Delivery Stream
     Value: !GetAtt IngestDataDeliveryStream.Arn
     Export:
