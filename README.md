@@ -1,4 +1,4 @@
-# Elgo Anomaly
+# Elgo AWS Pipeline
 
 #### Step 1: Clone repo and configure environment
 
@@ -27,18 +27,12 @@ Then, we are going to use the contents in provisioning_cf_script folder.
 cd cloud_formation
 ```
 
-### Step 2: Understand deploy.sh script
-
-Examine the deploy.sh file. This is the starting point of the cloud formation.
-This bash script first creates a S3 bucket to store all of the relevant assets created in this repo. Then, it
-calls `template.yaml` CloudFormation script with AWS SAM CLI toolset.
-
-### Step 3: Run deployment of cloud resources
+### Step 2: Run deployment of cloud resources
 
 Run the provisioning script:
 
 ```
-. deploy.sh
+./deploy.sh
 ```
 
-After CloudFormation runs successfully, the cloud resources all the way to Sagemaker should be created.
+After CloudFormation runs successfully, the cloud resources should be created. 
